@@ -151,6 +151,24 @@ already differ. Each indexer paces its own requests, so on one host their CoW AP
 add up. The site shows each network on its own page: Base at `/`, BNB Chain at `/bnb` (see
 [Networks on the site](#networks-on-the-site)).
 
+### HyperSync
+
+With `ENVIO_API_TOKEN` set, `sync` reads the chain data it ingests from
+[HyperSync](https://docs.envio.dev/docs/HyperSync/overview), Envio's indexed copy of the chain,
+instead of the RPC (`apps/indexer/src/hypersync.ts`). One query returns a block range's logs
+together with the transactions that emitted them, with their receipts' gas, fee and L1 data fee,
+their calldata and their blocks' timestamps: what the RPC gives in an `eth_getLogs` and two calls
+per batch transaction. A response holds a few MB at most, about 2,000 Base blocks of settlements,
+so a busy range takes another query. Queries wait on HyperSync's reads rather than on a rate limit,
+so more block ranges are fetched at once than with the RPC. The data stored is the same, row for
+row.
+
+The RPC still gives the safe block, the `eth_call`s (the native token's feed, the AllowList and
+token symbols) and the header timestamps of a range without logs. Those are a few calls a run, but
+they read past blocks, so BNB Chain still needs an archive node for `BNB_RPC_URL`. HyperSync's
+endpoint is `HYPERSYNC_URL`, by default the network's, `https://<chain id>.hypersync.xyz`. Envio
+issues API tokens at [app.envio.dev/api-tokens](https://app.envio.dev/api-tokens).
+
 ### Block times
 
 Every figure is counted in rolling days of 24 hours, and the page shows when each settlement and
@@ -267,6 +285,8 @@ at the network's default), it first downloads the database with `seed`.
 | ------------------------------------------------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `NETWORK`                                                           | indexer | The network to index: `base` (default) or `bnb` for BNB Chain; see [Choosing the network](#choosing-the-network)                                                                                                            |
 | `BASE_RPC_URL`, `BNB_RPC_URL`                                       | indexer | The network's RPC endpoint: Base's defaults to `https://mainnet.base.org`; BNB Chain's has no default and must be an archive node                                                                                           |
+| `ENVIO_API_TOKEN`                                                   | indexer | An Envio API token: `sync` then reads logs, receipts and calldata from HyperSync instead of the RPC; see [HyperSync](#hypersync)                                                                                            |
+| `HYPERSYNC_URL`                                                     | indexer | HyperSync's endpoint (default `https://<chain id>.hypersync.xyz`: `8453` for Base, `56` for BNB Chain)                                                                                                                      |
 | `DB_PATH`                                                           | indexer | The SQLite database (default `apps/indexer/.data/<network>.db`); `--db` overrides it                                                                                                                                        |
 | `BASE_RPC_RPS` or `BNB_RPC_RPS`, `COW_API_RPS`                      | indexer | Request rates per second for the network's RPC and CoW's API (defaults 15 and 3)                                                                                                                                            |
 | `REFRESH_MINUTES`                                                   | indexer | `loop.sh`'s interval (default 10). Through the snapshot, an open page also learns when the next run is due and fetches a minute after it. At any interval, the page shows Delayed once its data is more than 30 minutes old |

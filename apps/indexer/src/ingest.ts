@@ -14,6 +14,7 @@ import {
 import type { Log, TradeRow } from "./chain.ts";
 import type { Anchor } from "./clock.ts";
 import { NETWORK } from "./config.ts";
+import type { HyperSync } from "./hypersync.ts";
 import { duration, fmt, log, throttledLog } from "./log.ts";
 import { answerAt, feedSegments, pricePoints } from "./prices.ts";
 import type { FeedSegment } from "./prices.ts";
@@ -24,6 +25,12 @@ import { readOrderTerms } from "./terms.ts";
 
 /** Block ranges in flight at once, the next one to commit included. */
 const PIPELINE = 2;
+/**
+ * The same with HyperSync, whose queries wait on its reads rather than on a rate: a query took
+ * from 0.1 to 12 seconds on Base, longest on blocks it had not read lately. With 8 in flight a day
+ * of Base took 7–18 seconds; with 2, 22–62 seconds; 16 did no better than 8.
+ */
+const HYPERSYNC_PIPELINE = 8;
 /** `eth_getLogs` requests in flight at once while order uids are filled in. */
 const UID_LANES = 4;
 
@@ -81,10 +88,13 @@ class AllowList {
  * logs, a receipt and the calldata of each batch transaction, with the order terms the calldata
  * gives its trades, the native token's USD answers of the aggregators that `feed` says the
  * Chainlink proxy used, and the clock's anchors. The senders and recipients of relay settlements
- * get an AllowList verdict on the way.
+ * get an AllowList verdict on the way. With `hypersync`, the logs come with their transactions'
+ * receipts and calldata in a query or two; without it, the RPC gives them in an `eth_getLogs`
+ * and two calls per batch transaction.
  */
 async function fetchChunk(
 	rpc: Rpc,
+	hypersync: HyperSync | null,
 	range: BlockRange,
 	feed: FeedSegment[],
 	allowList: AllowList
@@ -92,13 +102,11 @@ async function fetchChunk(
 	const aggregators = feed
 		.filter((segment) => segment.from <= range.to && range.from <= segment.to)
 		.map((segment) => segment.aggregator);
-	const logs = await getLogs(
-		rpc,
-		range.from,
-		range.to,
-		[SETTLEMENT, ...new Set(aggregators)],
-		[[TOPIC.settlement, TOPIC.trade, TOPIC.interaction, TOPIC.answerUpdated]]
-	);
+	const address = [SETTLEMENT, ...new Set(aggregators)];
+	const topics = [[TOPIC.settlement, TOPIC.trade, TOPIC.interaction, TOPIC.answerUpdated]];
+	const fetched =
+		hypersync === null ? null : await hypersync.logs(range.from, range.to, address, topics);
+	const logs = fetched?.logs ?? (await getLogs(rpc, range.from, range.to, address, topics));
 	const { settlements, trades } = parseSettlementLogs(
 		logs.filter((entry) => entry.address.toLowerCase() === SETTLEMENT)
 	);
@@ -110,11 +118,13 @@ async function fetchChunk(
 		if (RELAYS.includes(settlement.solver)) relayed.add(settlement.tx);
 	}
 	const hashes = [...blockOf.keys()];
-	const [receipts, inputs] = await Promise.all([
-		getReceipts(rpc, hashes),
-		getInputs(rpc, hashes),
-	]);
-	const txs: TxRow[] = [...receipts].map(([tx, receipt]) => {
+	const [receipts, inputs] =
+		fetched === null
+			? await Promise.all([getReceipts(rpc, hashes), getInputs(rpc, hashes)])
+			: [fetched.receipts, fetched.inputs];
+	const txs: TxRow[] = hashes.map((tx) => {
+		const receipt = receipts.get(tx);
+		if (receipt === undefined) throw new Error(`no receipt for ${tx}`);
 		const block = Number(receipt.blockNumber);
 		if (block !== blockOf.get(tx)) {
 			throw new Error(
@@ -237,6 +247,7 @@ export async function seedNativeUsd(store: Store, rpc: Rpc): Promise<void> {
 export async function backfillChain(
 	store: Store,
 	rpc: Rpc,
+	hypersync: HyperSync | null,
 	low: number,
 	head: number,
 	stats: IngestStats,
@@ -247,13 +258,14 @@ export async function backfillChain(
 	for (let to = top; to >= low; to -= NETWORK.logRange) {
 		ranges.push({ from: Math.max(low, to - NETWORK.logRange + 1), to });
 	}
-	await ingest(store, rpc, ranges, "backfill", stats, stop);
+	await ingest(store, rpc, hypersync, ranges, "backfill", stats, stop);
 }
 
 /** Extends chain data up to `head`. */
 export async function catchUpChain(
 	store: Store,
 	rpc: Rpc,
+	hypersync: HyperSync | null,
 	head: number,
 	stats: IngestStats
 ): Promise<void> {
@@ -261,7 +273,7 @@ export async function catchUpChain(
 	for (let from = store.chainRange()!.to + 1; from <= head; from += NETWORK.logRange) {
 		ranges.push({ from, to: Math.min(head, from + NETWORK.logRange - 1) });
 	}
-	await ingest(store, rpc, ranges, "catch-up", stats);
+	await ingest(store, rpc, hypersync, ranges, "catch-up", stats);
 }
 
 /**
@@ -273,6 +285,7 @@ export async function catchUpChain(
 async function ingest(
 	store: Store,
 	rpc: Rpc,
+	hypersync: HyperSync | null,
 	ranges: BlockRange[],
 	label: string,
 	stats: IngestStats,
@@ -283,17 +296,19 @@ async function ingest(
 	const callsBefore = rpc.stats.calls;
 	const low = ranges.reduce((min, range) => Math.min(min, range.from), Infinity);
 	const high = ranges.reduce((max, range) => Math.max(max, range.to), -Infinity);
-	log(`chain ${label}: blocks ${low}..${high}, ${fmt(ranges.length)} ranges`);
+	const source = hypersync === null ? "" : " from HyperSync";
+	log(`chain ${label}: blocks ${low}..${high}, ${fmt(ranges.length)} ranges${source}`);
 	const feed = await feedSegments(rpc, low, high);
 	const allowList = new AllowList(store, rpc);
 	let done = 0;
 	let receipts = 0;
 	const report = throttledLog();
+	const depth = hypersync === null ? PIPELINE : HYPERSYNC_PIPELINE;
 	const queue: Promise<ChainChunk>[] = [];
 	let next = 0;
 	const refill = () => {
-		while (queue.length < PIPELINE && next < ranges.length && !stop?.aborted) {
-			const pending = fetchChunk(rpc, ranges[next++], feed, allowList);
+		while (queue.length < depth && next < ranges.length && !stop?.aborted) {
+			const pending = fetchChunk(rpc, hypersync, ranges[next++], feed, allowList);
 			pending.catch(() => {}); // awaited in order below
 			queue.push(pending);
 		}

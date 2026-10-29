@@ -7,6 +7,7 @@ import { NETWORKS } from "@fiberscope/core";
 import { attributionReport, termsReport } from "./checks.ts";
 import { DEFAULT_DB_PATH, DEFAULT_SNAPSHOT_PATH, type Env, NETWORK, readEnv } from "./config.ts";
 import { CowApi } from "./cow.ts";
+import { HyperSync } from "./hypersync.ts";
 import { duration, fmt, log } from "./log.ts";
 import { OVERRIDES } from "./overrides.ts";
 import { Registry } from "./registry.ts";
@@ -52,7 +53,9 @@ const USAGE = `Usage:
 Every command takes --db <path> (default DB_PATH, else ${relative(process.cwd(), DEFAULT_DB_PATH)}).
 Environment: NETWORK, the network to index (${Object.keys(NETWORKS).join(" or ")}, default base), and
 its RPC endpoint and rate: BASE_RPC_URL and BASE_RPC_RPS, or BNB_RPC_URL (required) and
-BNB_RPC_RPS. Also COW_API_RPS, REFRESH_MINUTES and GIT_COMMIT. With SNAPSHOT_R2_BUCKET (plus
+BNB_RPC_RPS. With ENVIO_API_TOKEN, sync reads the chain's logs, receipts and calldata from
+HyperSync (HYPERSYNC_URL, default https://${NETWORK.chainId}.hypersync.xyz) instead of the RPC.
+Also COW_API_RPS, REFRESH_MINUTES and GIT_COMMIT. With SNAPSHOT_R2_BUCKET (plus
 CLOUDFLARE_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY and optionally SNAPSHOT_R2_KEY,
 default ${NETWORK.id}/snapshot.json) every snapshot written is also uploaded to that R2 bucket.
 `;
@@ -99,12 +102,17 @@ async function main(): Promise<void> {
 			const snapshotPath = values.snapshot;
 			const rpc = new Rpc(env.rpcUrl, env.rpcRps);
 			const cow = new CowApi(NETWORK.cowApi, env.cowApiRps);
+			const hypersync =
+				env.hypersync === null
+					? null
+					: new HyperSync(env.hypersync.url, env.hypersync.token);
 			const options = {
 				chainDays: wholeNumber(values["chain-days"], "chain-days", 0),
 				auctionDays: wholeNumber(values["auction-days"], "auction-days", 0),
 				budgetMinutes:
 					budget === undefined ? null : wholeNumber(budget, "budget-minutes", null),
 				prune: values.prune === true,
+				hypersync,
 				writeSnapshot:
 					snapshotPath === undefined
 						? null
@@ -128,6 +136,13 @@ async function main(): Promise<void> {
 				.sort(([, a], [, b]) => b - a)
 				.map(([method, calls]) => `${method} ${fmt(calls)}`);
 			log(`  RPC calls by method: ${byMethod.join(", ") || "none"}`);
+			if (hypersync !== null) {
+				const { queries, retries, bytes } = hypersync.stats;
+				log(
+					`  HyperSync: ${fmt(queries)} queries, ${fmt(bytes / 1e6)} MB uncompressed, ` +
+						`${fmt(retries)} retries`
+				);
+			}
 			log(
 				`  auctions ${auctions ? `${auctions.from}..${auctions.to}` : "none"}: ${fmt(lookups)} lookups ` +
 					`(${fmt(missing)} not found) in ${duration(auctionSeconds)} ` +

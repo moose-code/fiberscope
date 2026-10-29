@@ -8,6 +8,7 @@ import { NETWORK } from "./config.ts";
 import type { CowApi } from "./cow.ts";
 import { backfillDetails, catchUpDetails, detailCatchUpRequests } from "./details.ts";
 import type { DetailStats, DetailWatch } from "./details.ts";
+import type { HyperSync } from "./hypersync.ts";
 import {
 	backfillChain,
 	catchUpChain,
@@ -34,6 +35,11 @@ export interface SyncOptions {
 	budgetMinutes: number | null;
 	/** Delete the data older than the requested depths once the head is caught up. */
 	prune: boolean;
+	/**
+	 * Where the chain's logs, receipts and calldata come from instead of the RPC; null for the
+	 * RPC. The RPC still gives the safe block and the contract calls.
+	 */
+	hypersync: HyperSync | null;
 	/**
 	 * Writes the snapshot: once the data is current, and again at the end of the run if it would
 	 * show more by then (on an empty database, only after the backfill).
@@ -74,7 +80,7 @@ export async function sync(
 	cow: CowApi,
 	options: SyncOptions
 ): Promise<SyncStats> {
-	const { budgetMinutes, writeSnapshot } = options;
+	const { budgetMinutes, writeSnapshot, hypersync } = options;
 	const budget = budgetMinutes === null ? null : AbortSignal.timeout(budgetMinutes * 60_000);
 	const registry = await refreshRegistry(store, AbortSignal.timeout(CMS_TIMEOUT_MS));
 	const chainDays = Math.max(options.chainDays, options.auctionDays);
@@ -105,7 +111,7 @@ export async function sync(
 		days = new Days(new Clock([head], NETWORK.blockTime), head.block);
 	} else {
 		for (let round = 0; round < 3; round++) {
-			await catchUpChain(store, rpc, (await safeHead(rpc)).block, stats.chain);
+			await catchUpChain(store, rpc, hypersync, (await safeHead(rpc)).block, stats.chain);
 			await catchUpAuctions(store, cow, stats.auctions);
 			if ((await safeHead(rpc)).block - store.chainRange()!.to <= CATCH_UP_SLACK) break;
 		}
@@ -153,7 +159,15 @@ export async function sync(
 		try {
 			if (chainDays > 0) {
 				const low = days.reach(chainDays);
-				await backfillChain(store, rpc, low, days.end, stats.chain, budget ?? undefined);
+				await backfillChain(
+					store,
+					rpc,
+					hypersync,
+					low,
+					days.end,
+					stats.chain,
+					budget ?? undefined
+				);
 			}
 		} catch (error) {
 			abort.abort(error);

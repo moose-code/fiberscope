@@ -142,6 +142,7 @@ async function snapshots(
 		auctionDays: 0,
 		budgetMinutes: null,
 		prune: false,
+		hypersync: null,
 		...options,
 		writeSnapshot: async () => {
 			written.push(store.detailRange());

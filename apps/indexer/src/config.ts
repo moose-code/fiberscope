@@ -19,6 +19,14 @@ export const DEFAULT_SNAPSHOT_PATH = fileURLToPath(
 	new URL(`../../web/data/${NETWORK.id}/snapshot.json`, import.meta.url)
 );
 
+/** HyperSync, for the chain's logs, receipts and calldata (see hypersync.ts). */
+export interface HyperSyncTarget {
+	/** HYPERSYNC_URL, default the network's endpoint, https://<chain id>.hypersync.xyz. */
+	url: string;
+	/** ENVIO_API_TOKEN: an Envio API token. */
+	token: string;
+}
+
 /** The R2 object every snapshot is uploaded to, through R2's S3 API. */
 export interface R2Target {
 	accountId: string;
@@ -36,6 +44,11 @@ export interface Env {
 	rpcUrl: string;
 	/** Most RPC calls per second (BASE_RPC_RPS or BNB_RPC_RPS); every call in a batch counts. */
 	rpcRps: number;
+	/**
+	 * Where the chain's logs, receipts and calldata come from instead of the RPC; null without
+	 * ENVIO_API_TOKEN.
+	 */
+	hypersync: HyperSyncTarget | null;
 	/** Most CoW API requests per second. */
 	cowApiRps: number;
 	/**
@@ -71,11 +84,18 @@ export function readEnv(env: NodeJS.ProcessEnv = process.env): Env {
 		dbPath: env.DB_PATH || DEFAULT_DB_PATH,
 		rpcUrl,
 		rpcRps: positive(env, `${rpc}_RPS`, 15),
+		hypersync: hypersyncTarget(env),
 		cowApiRps: positive(env, "COW_API_RPS", 3),
 		refreshMinutes: positive(env, "REFRESH_MINUTES", 10),
 		upload: r2Target(env),
 		commit: commit(env),
 	};
+}
+
+function hypersyncTarget(env: NodeJS.ProcessEnv): HyperSyncTarget | null {
+	const token = env.ENVIO_API_TOKEN;
+	if (!token) return null;
+	return { url: env.HYPERSYNC_URL || `https://${NETWORK.chainId}.hypersync.xyz`, token };
 }
 
 function r2Target(env: NodeJS.ProcessEnv): R2Target | null {
